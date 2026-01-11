@@ -44,6 +44,15 @@ const lastDrawnPos = ref<{ row: number; col: number } | null>(null);
 const brushSize = ref(1);
 const hoveredCell = ref<{ row: number; col: number } | null>(null);
 
+// Panning state
+const isPanning = ref(false);
+const panStart = ref<{ x: number; y: number; scrollLeft: number; scrollTop: number } | null>(null);
+const canvasWrapper = ref<HTMLDivElement | null>(null);
+
+// Toolbar state
+const toolbarVisible = ref(true);
+const isSmallScreen = ref(window.innerWidth < 1000);
+
 // History state for undo/redo
 const history = ref<string[][][]>([]);
 const historyIndex = ref(-1);
@@ -390,18 +399,24 @@ const getCanvasCoordinates = (event: MouseEvent): { row: number; col: number } |
 };
 
 const onCanvasMouseDown = (event: MouseEvent) => {
-  event.preventDefault();
-  const coords = getCanvasCoordinates(event);
-  if (coords) {
-    startDrawing(coords.row, coords.col);
+  // Only handle left-click for drawing
+  if (event.button === 0 && !isPanning.value) {
+    event.preventDefault();
+    const coords = getCanvasCoordinates(event);
+    if (coords) {
+      startDrawing(coords.row, coords.col);
+    }
   }
 };
 
 const onCanvasMouseMove = (event: MouseEvent) => {
-  // Always try to get coordinates, even outside canvas during drag
+  // Don't handle if panning
+  if (isPanning.value) return;
+  
+  // Always try to get coordinates
   const coords = getCanvasCoordinates(event);
   
-  // Check if left mouse button is pressed
+  // Check if left mouse button is pressed for drawing
   if (event.buttons === 1) {
     if (!isDrawing.value && (currentTool.value === 'pencil' || currentTool.value === 'eraser')) {
       // Resume drawing if button is held
@@ -428,6 +443,8 @@ const onCanvasMouseMove = (event: MouseEvent) => {
 
 const onCanvasMouseUp = () => {
   stopDrawing();
+  isPanning.value = false;
+  panStart.value = null;
 };
 
 const onCanvasMouseLeave = () => {
@@ -438,6 +455,50 @@ const onCanvasMouseLeave = () => {
   if (hoveredCell.value) {
     hoveredCell.value = null;
     renderCanvas();
+  }
+  
+  // Stop panning when leaving canvas
+  isPanning.value = false;
+  panStart.value = null;
+};
+
+const onContextMenu = (event: MouseEvent) => {
+  event.preventDefault(); // Prevent context menu on right-click
+};
+
+const toggleToolbar = () => {
+  toolbarVisible.value = !toolbarVisible.value;
+};
+
+// Wrapper panning events
+const onWrapperMouseDown = (event: MouseEvent) => {
+  if (event.button === 2 && canvasWrapper.value) {
+    event.preventDefault();
+    isPanning.value = true;
+    panStart.value = {
+      x: event.clientX,
+      y: event.clientY,
+      scrollLeft: canvasWrapper.value.scrollLeft,
+      scrollTop: canvasWrapper.value.scrollTop
+    };
+  }
+};
+
+const onWrapperMouseMove = (event: MouseEvent) => {
+  if (isPanning.value && panStart.value && canvasWrapper.value) {
+    event.preventDefault();
+    const deltaX = event.clientX - panStart.value.x;
+    const deltaY = event.clientY - panStart.value.y;
+    
+    canvasWrapper.value.scrollLeft = panStart.value.scrollLeft - deltaX;
+    canvasWrapper.value.scrollTop = panStart.value.scrollTop - deltaY;
+  }
+};
+
+const onWrapperMouseUp = () => {
+  if (isPanning.value) {
+    isPanning.value = false;
+    panStart.value = null;
   }
 };
 
@@ -494,28 +555,73 @@ const resizeGrid = () => {
 
 // Export functions
 const exportAsPNG = () => {
-  const canvas = document.createElement('canvas');
-  canvas.width = gridWidth.value;
-  canvas.height = gridHeight.value;
-  const ctx = canvas.getContext('2d');
-  
-  if (!ctx) return;
-
-  for (let row = 0; row < gridHeight.value; row++) {
-    for (let col = 0; col < gridWidth.value; col++) {
-      ctx.fillStyle = grid.value[row][col];
-      ctx.fillRect(col, row, 1, 1);
+  showDialog('prompt', 'Export PNG', 'Enter scale factor (1-16, default: 1 for 1:1):', async (value) => {
+    if (!value) return;
+    
+    const scale = parseInt(value as string);
+    
+    if (isNaN(scale) || scale < 1 || scale > 16) {
+      showDialog('alert', 'Invalid Scale', 'Please enter a scale between 1 and 16.', () => {});
+      return;
     }
-  }
+    
+    // Create canvas at scaled size
+    const exportCanvas = document.createElement('canvas');
+    exportCanvas.width = gridWidth.value * scale;
+    exportCanvas.height = gridHeight.value * scale;
+    const exportCtx = exportCanvas.getContext('2d');
+    
+    if (!exportCtx) return;
 
-  canvas.toBlob((blob) => {
-    if (!blob) return;
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'pixel-art.png';
-    a.click();
-    URL.revokeObjectURL(url);
+    // Disable image smoothing for crisp pixels
+    exportCtx.imageSmoothingEnabled = false;
+
+    // Draw each pixel at the scaled size
+    for (let row = 0; row < gridHeight.value; row++) {
+      for (let col = 0; col < gridWidth.value; col++) {
+        exportCtx.fillStyle = grid.value[row][col];
+        exportCtx.fillRect(col * scale, row * scale, scale, scale);
+      }
+    }
+
+    // Convert canvas to blob
+    exportCanvas.toBlob(async (blob) => {
+      if (!blob) {
+        showDialog('alert', 'Export Failed', 'Failed to create image.', () => {});
+        return;
+      }
+
+      try {
+        // For Tauri, use the save dialog
+        const { save } = await import('@tauri-apps/plugin-dialog');
+        const { writeFile } = await import('@tauri-apps/plugin-fs');
+        
+        const filePath = await save({
+          filters: [{
+            name: 'PNG Image',
+            extensions: ['png']
+          }],
+          defaultPath: `pixel-art-${scale}x.png`
+        });
+
+        if (filePath) {
+          const arrayBuffer = await blob.arrayBuffer();
+          const uint8Array = new Uint8Array(arrayBuffer);
+          await writeFile(filePath, uint8Array);
+          showDialog('alert', 'Success', `Image saved successfully at ${scale}x scale!`, () => {});
+        }
+      } catch (error) {
+        // Fallback for web/dev mode - use download link
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `pixel-art-${scale}x.png`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
+    }, 'image/png');
   });
 };
 
@@ -543,7 +649,33 @@ onMounted(() => {
     ctx.value = canvas.value.getContext('2d');
   }
   initializeGrid();
-  document.addEventListener('mouseup', stopDrawing);
+  
+  // Global mouse up handler for drawing and panning
+  const handleGlobalMouseUp = () => {
+    stopDrawing();
+    isPanning.value = false;
+    panStart.value = null;
+  };
+  
+  document.addEventListener('mouseup', handleGlobalMouseUp);
+  
+  // Handle window resize for toolbar visibility
+  const handleResize = () => {
+    const wasSmallScreen = isSmallScreen.value;
+    isSmallScreen.value = window.innerWidth < 1000;
+    
+    // Auto-show toolbar when going to large screen
+    if (wasSmallScreen && !isSmallScreen.value) {
+      toolbarVisible.value = true;
+    }
+    // Auto-hide toolbar when going to small screen
+    if (!wasSmallScreen && isSmallScreen.value) {
+      toolbarVisible.value = false;
+    }
+  };
+  
+  window.addEventListener('resize', handleResize);
+  handleResize(); // Set initial state
   
   // Keyboard shortcuts
   document.addEventListener('keydown', (event) => {
@@ -563,10 +695,19 @@ onMounted(() => {
 
 <template>
   <div class="app">
+    <!-- Hamburger Menu Button -->
+    <button class="hamburger-btn" @click="toggleToolbar" :class="{ active: toolbarVisible }">
+      <span></span>
+      <span></span>
+      <span></span>
+    </button>
+
+    <!-- Toolbar Overlay -->
+    <div v-if="toolbarVisible" class="toolbar-overlay" @click="toggleToolbar"></div>
 
     <div class="container">
       <!-- Toolbar -->
-      <div class="toolbar">
+      <div class="toolbar" :class="{ visible: toolbarVisible }">
         <div class="tool-section">
           <h3>Tools</h3>
           <div class="tools">
@@ -674,13 +815,20 @@ onMounted(() => {
 
       <!-- Canvas -->
       <div class="canvas-container">
-        <div class="canvas-wrapper">
+        <div 
+          class="canvas-wrapper" 
+          ref="canvasWrapper"
+          @mousedown="onWrapperMouseDown"
+          @mousemove="onWrapperMouseMove"
+          @mouseup="onWrapperMouseUp"
+          @contextmenu="onContextMenu"
+        >
           <div class="canvas-zoom-wrapper" :style="{ transform: `scale(${zoomLevel})` }" @wheel="handleWheel">
             <canvas
               ref="canvas"
               class="pixel-canvas"
               :style="{
-                cursor: currentTool === 'eyedropper' ? 'crosshair' : 'pointer'
+                cursor: isPanning ? 'grabbing' : (currentTool === 'eyedropper' ? 'crosshair' : 'default')
               }"
               @mousedown="onCanvasMouseDown"
               @mousemove="onCanvasMouseMove"
@@ -736,6 +884,77 @@ onMounted(() => {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
   display: flex;
   flex-direction: column;
+  min-width: 600px;
+  min-height: 500px;
+}
+
+/* Hamburger Menu Button */
+.hamburger-btn {
+  position: fixed;
+  top: 15px;
+  left: 15px;
+  z-index: 1001;
+  width: 45px;
+  height: 45px;
+  background: white;
+  border: 2px solid #e0e0e0;
+  border-radius: 8px;
+  cursor: pointer;
+  display: none; /* Hidden by default on large screens */
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  transition: all 0.3s;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+@media (max-width: 999px) {
+  .hamburger-btn {
+    display: flex; /* Show on small screens */
+  }
+}
+
+.hamburger-btn:hover {
+  background: #667eea;
+  border-color: #667eea;
+}
+
+.hamburger-btn span {
+  width: 24px;
+  height: 3px;
+  background: #333;
+  border-radius: 2px;
+  transition: all 0.3s;
+}
+
+.hamburger-btn:hover span {
+  background: white;
+}
+
+.hamburger-btn.active span:nth-child(1) {
+  transform: translateY(9px) rotate(45deg);
+}
+
+.hamburger-btn.active span:nth-child(2) {
+  opacity: 0;
+}
+
+.hamburger-btn.active span:nth-child(3) {
+  transform: translateY(-9px) rotate(-45deg);
+}
+
+/* Toolbar Overlay */
+.toolbar-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 999;
+  backdrop-filter: blur(2px);
 }
 
 .container {
@@ -745,19 +964,40 @@ onMounted(() => {
   flex: 1;
   overflow: hidden;
   min-height: 0;
+  position: relative;
 }
 
 /* Toolbar */
 .toolbar {
   background: white;
-  border-radius: 8px;
   padding: 10px;
-  min-width: 250px;
-  max-width: 280px;
-  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
-  max-height: 100%;
+  width: 280px;
   overflow-y: auto;
   overflow-x: hidden;
+  transition: all 0.3s ease;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+  border-radius: 8px;
+  flex-shrink: 0;
+  max-height: 100%;
+}
+
+/* Slide-in behavior on small screens */
+@media (max-width: 999px) {
+  .toolbar {
+    position: fixed;
+    left: -280px;
+    top: 0;
+    bottom: 0;
+    padding: 70px 10px 10px;
+    z-index: 1000;
+    box-shadow: 2px 0 20px rgba(0, 0, 0, 0.15);
+    border-radius: 0;
+    max-height: none;
+  }
+  
+  .toolbar.visible {
+    left: 0;
+  }
 }
 
 .app-title {
@@ -1013,6 +1253,13 @@ onMounted(() => {
   position: relative;
 }
 
+/* Full width on small screens */
+@media (max-width: 999px) {
+  .canvas-container {
+    width: 100%;
+  }
+}
+
 .canvas-wrapper {
   display: flex;
   justify-content: center;
@@ -1023,6 +1270,26 @@ onMounted(() => {
   flex: 1;
   min-height: 0;
   width: 100%;
+  position: relative;
+}
+
+.canvas-wrapper::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+.canvas-wrapper::-webkit-scrollbar-track {
+  background: #f0f0f0;
+  border-radius: 4px;
+}
+
+.canvas-wrapper::-webkit-scrollbar-thumb {
+  background: #ccc;
+  border-radius: 4px;
+}
+
+.canvas-wrapper::-webkit-scrollbar-thumb:hover {
+  background: #999;
 }
 
 .canvas-zoom-wrapper {
@@ -1056,13 +1323,32 @@ onMounted(() => {
 }
 
 /* Responsive */
-@media (max-width: 1024px) {
-  .container {
-    flex-direction: column;
+@media (max-width: 999px) {
+  .tool-section h3 {
+    font-size: 0.8rem;
   }
 
+  .tools button,
+  .actions button {
+    padding: 8px;
+    font-size: 0.85rem;
+  }
+
+  .color-input {
+    width: 50px;
+    height: 50px;
+  }
+}
+
+@media (max-width: 500px) {
   .toolbar {
-    max-width: 100%;
+    width: 220px;
+    left: -220px;
+  }
+
+  .hamburger-btn {
+    width: 40px;
+    height: 40px;
   }
 }
 
