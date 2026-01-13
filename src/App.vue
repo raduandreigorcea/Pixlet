@@ -48,6 +48,22 @@ const hoveredCell = ref<{ row: number; col: number } | null>(null);
 const isPanning = ref(false);
 const panStart = ref<{ x: number; y: number; scrollLeft: number; scrollTop: number } | null>(null);
 const canvasWrapper = ref<HTMLDivElement | null>(null);
+const containerSize = ref({ width: 0, height: 0 });
+
+// Computed style for zoom wrapper with conditional centering
+const zoomWrapperStyle = computed(() => {
+  const zoomedSize = CANVAS_SIZE * zoomLevel.value;
+  const { width: containerWidth, height: containerHeight } = containerSize.value;
+  
+  return {
+    width: `${zoomedSize}px`,
+    height: `${zoomedSize}px`,
+    marginLeft: containerWidth > 0 && zoomedSize < containerWidth ? 'auto' : '0',
+    marginRight: containerWidth > 0 && zoomedSize < containerWidth ? 'auto' : '0',
+    marginTop: containerHeight > 0 && zoomedSize < containerHeight ? 'auto' : '0',
+    marginBottom: containerHeight > 0 && zoomedSize < containerHeight ? 'auto' : '0',
+  };
+});
 
 // Toolbar state
 const toolbarVisible = ref(true);
@@ -640,8 +656,45 @@ const resetZoom = () => {
 
 const handleWheel = (event: WheelEvent) => {
   event.preventDefault();
+  
+  if (!canvasWrapper.value) return;
+  
+  // Calculate zoom delta
   const delta = event.deltaY > 0 ? -0.1 : 0.1;
-  zoomLevel.value = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, zoomLevel.value + delta));
+  const previousZoom = zoomLevel.value;
+  const nextZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, previousZoom + delta));
+  
+  // If zoom didn't actually change, return early
+  if (previousZoom === nextZoom) return;
+  
+  // Get mouse position relative to the canvas wrapper
+  const rect = canvasWrapper.value.getBoundingClientRect();
+  const mouseX = event.clientX - rect.left;
+  const mouseY = event.clientY - rect.top;
+  
+  // Get current scroll position
+  const scrollLeft = canvasWrapper.value.scrollLeft;
+  const scrollTop = canvasWrapper.value.scrollTop;
+  
+  // Calculate the point in canvas space (before zoom)
+  // This is the absolute position on the canvas that's under the cursor
+  const canvasPointX = (mouseX + scrollLeft) / previousZoom;
+  const canvasPointY = (mouseY + scrollTop) / previousZoom;
+  
+  // Update zoom level
+  zoomLevel.value = nextZoom;
+  
+  // Wait for DOM to update, then adjust scroll to keep canvas point under cursor
+  requestAnimationFrame(() => {
+    if (!canvasWrapper.value) return;
+    
+    // Calculate new scroll position to keep the same canvas point under cursor
+    const newScrollLeft = canvasPointX * nextZoom - mouseX;
+    const newScrollTop = canvasPointY * nextZoom - mouseY;
+    
+    canvasWrapper.value.scrollLeft = newScrollLeft;
+    canvasWrapper.value.scrollTop = newScrollTop;
+  });
 };
 
 onMounted(() => {
@@ -649,6 +702,22 @@ onMounted(() => {
     ctx.value = canvas.value.getContext('2d');
   }
   initializeGrid();
+  
+  // Track container size for conditional centering
+  if (canvasWrapper.value) {
+    const updateSize = () => {
+      if (canvasWrapper.value) {
+        containerSize.value = {
+          width: canvasWrapper.value.clientWidth,
+          height: canvasWrapper.value.clientHeight
+        };
+      }
+    };
+    updateSize();
+    
+    const resizeObserver = new ResizeObserver(updateSize);
+    resizeObserver.observe(canvasWrapper.value);
+  }
   
   // Global mouse up handler for drawing and panning
   const handleGlobalMouseUp = () => {
@@ -823,7 +892,7 @@ onMounted(() => {
           @mouseup="onWrapperMouseUp"
           @contextmenu="onContextMenu"
         >
-          <div class="canvas-zoom-wrapper" :style="{ transform: `scale(${zoomLevel})` }" @wheel="handleWheel">
+          <div class="canvas-zoom-wrapper" :style="zoomWrapperStyle" @wheel="handleWheel">
             <canvas
               ref="canvas"
               class="pixel-canvas"
@@ -1262,8 +1331,6 @@ onMounted(() => {
 
 .canvas-wrapper {
   display: flex;
-  justify-content: center;
-  align-items: center;
   padding: 5px;
   border-radius: 8px;
   overflow: auto;
@@ -1293,9 +1360,9 @@ onMounted(() => {
 }
 
 .canvas-zoom-wrapper {
-  transform-origin: center center;
-  transition: transform 0.1s ease-out;
-  will-change: transform;
+  display: flex;
+  flex-shrink: 0;
+  padding: 50px;
 }
 
 .pixel-canvas {
@@ -1307,6 +1374,8 @@ onMounted(() => {
   image-rendering: pixelated;
   image-rendering: crisp-edges;
   -ms-interpolation-mode: nearest-neighbor;
+  width: 100%;
+  height: 100%;
 }
 
 .info {
